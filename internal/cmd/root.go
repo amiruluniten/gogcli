@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -126,26 +127,31 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 	runtimeIO := runtime.IO
 
 	if len(args) == 0 {
-		args = []string{"--help"}
+		return runNoArgsDefaultView(runtime)
 	}
 	args = rewriteHelpArgs(args)
 
+	var jsonEarlyOut io.Writer
+	if argsRequestJSON(args) {
+		jsonEarlyOut = runtimeIO.Out
+	}
+
 	home, homeProvided := preScanHomeArg(args)
 	if bindErr := bindRuntimeLayoutResolver(runtime, home); bindErr != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, newUsageError(bindErr))
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, newUsageError(bindErr))
 	}
 	if homeProvided {
 		if validateErr := runtime.LayoutResolver.ValidateHomeOverride(); validateErr != nil {
-			return reportEarlyError(kctx, runtimeIO.Err, newUsageError(validateErr))
+			return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, newUsageError(validateErr))
 		}
 	}
 
 	parser, cli, err := newParserWithWriters(helpDescription(runtime), runtimeIO.Out, runtimeIO.Err)
 	if err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	if err = verifyLockedFlagsExist(parser.Model.Node); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	args = rewriteDocsCellUpdateContentArgs(parser.Model, args)
 	args = rewriteDesirePathArgs(parser.Model, args)
@@ -166,10 +172,10 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 
 	kctx, err = parser.Parse(args)
 	if err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, wrapParseError(err))
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, wrapParseError(err))
 	}
 	if err = validateExplicitBatchFlag(kctx); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	cli.diagnostics = runtimeIO.Err
 	cli.authOperations = runtime.Auth
@@ -195,24 +201,24 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 	}
 
 	if err = enforceBakedSafetyProfile(kctx); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	if err = enforceLockedFlags(kctx); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	// After the locks, so a locked output mode is what precedence resolves around
 	// rather than something a competing mode can leave in conflict.
 	if err = applyExplicitOutputModePrecedence(kctx, &cli.RootFlags); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	if err = enforceEnabledCommands(kctx, cli.EnableCommands, cli.EnableCommandsExact); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	if err = enforceDisabledCommands(kctx, cli.DisableCommands); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 	if err = enforceGmailNoSend(kctx, &cli.RootFlags, runtime); err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 
 	logLevel := slog.LevelWarn
@@ -227,11 +233,11 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 
 	mode, err := outfmt.FromFlags(cli.JSON, cli.Plain)
 	if err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, newUsageError(err))
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, newUsageError(err))
 	}
 	err = validateJSONTransformFlags(mode, &cli.RootFlags)
 	if err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, err)
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, err)
 	}
 
 	ctx := context.Background()
@@ -334,7 +340,7 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 		Color:  uiColor,
 	})
 	if err != nil {
-		return reportEarlyError(kctx, runtimeIO.Err, newUsageError(err))
+		return reportEarlyError(kctx, runtimeIO.Err, jsonEarlyOut, newUsageError(err))
 	}
 	ctx = ui.WithUI(ctx, u)
 
@@ -351,6 +357,9 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 	}
 	err = stableExitCode(err)
 
+	if outfmt.IsJSON(ctx) {
+		emitJSONErrorEnvelope(runtimeIO.Out, err)
+	}
 	if u := ui.FromContext(ctx); u != nil {
 		msg := errorMessage(kctx, err)
 		if msg != "" {
@@ -452,7 +461,78 @@ func applyExplicitOutputModePrecedence(kctx *kong.Context, flags *RootFlags) err
 	return nil
 }
 
-func reportEarlyError(kctx *kong.Context, w io.Writer, err error) error {
+// argsRequestJSON reports whether the user explicitly asked for --json on the
+// command line, for envelope emission on paths that run before the output mode
+// is resolved (e.g. parse errors).
+func argsRequestJSON(args []string) bool {
+	for _, a := range args {
+		if a == "--json" || strings.HasPrefix(a, "--json=") {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonErrorClass(code int) string {
+	switch code {
+	case 2:
+		return "usage"
+	case emptyResultsExitCode:
+		return "empty_results"
+	case exitCodeAuthRequired:
+		return "auth"
+	case exitCodeNotFound:
+		return "not_found"
+	case exitCodePermissionDenied:
+		return "permission_denied"
+	case exitCodeRateLimited:
+		return "rate_limited"
+	case exitCodeConfig:
+		return "config"
+	case exitCodeCancelled:
+		return "cancelled"
+	default:
+		return "api"
+	}
+}
+
+// emitJSONErrorEnvelope writes a machine-readable error envelope on stdout so
+// JSON consumers never have to scrape human-oriented stderr. Human prose still
+// goes to stderr unchanged.
+func emitJSONErrorEnvelope(w io.Writer, err error) {
+	if w == nil || err == nil {
+		return
+	}
+	code := ExitCode(err)
+	if code == 0 {
+		return
+	}
+	msg := strings.TrimSpace(errfmt.Format(err))
+	if msg == "" {
+		msg = err.Error()
+	}
+	msgJSON, _ := json.Marshal(msg)
+	fmt.Fprintf(w, "{\"error\":{\"code\":%d,\"message\":%s,\"class\":%q}}\n", code, msgJSON, jsonErrorClass(code))
+}
+
+// runNoArgsDefaultView replaces the old "no args = help" behavior with a
+// compact status view: two identifying lines followed by `gog status` output.
+func runNoArgsDefaultView(runtime *app.Runtime) error {
+	io0 := normalizedRuntime(runtime).IO
+	if exe, exeErr := os.Executable(); exeErr == nil {
+		fmt.Fprintf(io0.Out, "bin: %s\n", exe)
+	} else {
+		fmt.Fprintln(io0.Out, "bin: gog")
+	}
+	fmt.Fprintln(io0.Out, "description: Google Workspace from the terminal")
+	err := executeWithRuntime([]string{"status"}, runtime)
+	if err != nil && ExitCode(err) != 0 {
+		fmt.Fprintln(io0.Err, "help: Run gog auth add <email> --services <svc>")
+	}
+	return err
+}
+
+func reportEarlyError(kctx *kong.Context, w io.Writer, jsonOut io.Writer, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -460,6 +540,7 @@ func reportEarlyError(kctx *kong.Context, w io.Writer, err error) error {
 	if msg != "" {
 		_, _ = fmt.Fprintln(w, msg)
 	}
+	emitJSONErrorEnvelope(jsonOut, err)
 	return err
 }
 
